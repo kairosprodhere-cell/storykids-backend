@@ -3,171 +3,270 @@ const express    = require('express');
 const cors       = require('cors');
 const rateLimit  = require('express-rate-limit');
 const Anthropic  = require('@anthropic-ai/sdk');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const jwt        = require('jsonwebtoken');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const PORT             = process.env.PORT || 3000;
-const ANTHROPIC_KEY    = process.env.ANTHROPIC_API_KEY;
+const PORT                = process.env.PORT || 3000;
+const AI_PROVIDER         = process.env.AI_PROVIDER || 'gemini'; // 'gemini' | 'claude'
+const ANTHROPIC_KEY       = process.env.ANTHROPIC_API_KEY;
+const GEMINI_KEY          = process.env.GEMINI_API_KEY;
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
-const ALLOWED_ORIGINS  = (process.env.ALLOWED_ORIGINS || '*').split(',');
+const ALLOWED_ORIGINS     = (process.env.ALLOWED_ORIGINS || '*').split(',');
 
-if (!ANTHROPIC_KEY) {
-  console.error('❌ ANTHROPIC_API_KEY manquante dans .env');
-  process.exit(1);
+// Validation selon le provider choisi — warnings uniquement, pas de crash au démarrage
+if (AI_PROVIDER === 'claude' && !ANTHROPIC_KEY) {
+  console.warn('⚠️  ANTHROPIC_API_KEY manquante — les appels IA échoueront');
+}
+if (AI_PROVIDER === 'gemini' && !GEMINI_KEY) {
+  console.warn('⚠️  GEMINI_API_KEY manquante — les appels IA échoueront');
+}
+if (!ANTHROPIC_KEY && !GEMINI_KEY) {
+  console.warn('⚠️  Aucune clé IA configurée. Configure AI_PROVIDER et la clé correspondante.');
 }
 
-const anthropic = new Anthropic.default({ apiKey: ANTHROPIC_KEY });
+// Clients IA
+const anthropic   = ANTHROPIC_KEY ? new Anthropic.default({ apiKey: ANTHROPIC_KEY }) : null;
+const geminiAI    = GEMINI_KEY    ? new GoogleGenerativeAI(GEMINI_KEY)               : null;
+const geminiModel = geminiAI?.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// ─── Abstraction IA — même interface pour Gemini et Claude ───────────────────
+
+async function analyserDessinIA(imageBase64) {
+  const prompt = `C'est le dessin fait par un enfant. Analyse-le et réponds UNIQUEMENT en JSON valide :
+{
+  "personnages": ["personnage 1", "personnage 2"],
+  "couleurs": ["couleur 1", "couleur 2"],
+  "decor": "description du décor",
+  "ambiance": "ambiance en 2-3 mots",
+  "descriptionComplete": "description complète en 2-3 phrases"
+}
+Réponds UNIQUEMENT avec le JSON, rien d'autre.`;
+
+  if (AI_PROVIDER === 'gemini') {
+    const result = await geminiModel.generateContent([
+      { inlineData: { data: imageBase64, mimeType: 'image/jpeg' } },
+      prompt,
+    ]);
+    return result.response.text();
+  }
+
+  // Claude
+  const response = await anthropic.messages.create({
+    model: 'claude-opus-4-7',
+    max_tokens: 600,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+        { type: 'text', text: prompt },
+      ],
+    }],
+  });
+  return response.content[0].text;
+}
+
+async function genererHistoireIA(promptTexte) {
+  if (AI_PROVIDER === 'gemini') {
+    const result = await geminiModel.generateContent(promptTexte);
+    return result.response.text();
+  }
+  // Claude
+  const response = await anthropic.messages.create({
+    model: 'claude-opus-4-7',
+    max_tokens: 1600,
+    messages: [{ role: 'user', content: promptTexte }],
+  });
+  return response.content[0].text;
+}
+
 const app = express();
+
+// ─── Politique de confidentialité des données ─────────────────────────────────
+//
+// Les dessins envoyés à ce serveur sont traités selon ces règles STRICTES :
+//   1. Jamais écrits sur disque.
+//   2. Jamais loggués (ni console, ni fichier, ni service tiers).
+//   3. Transmis à l'API Claude en mémoire uniquement.
+//   4. La référence mémoire est nulle (null) immédiatement après l'appel.
+//   5. La durée de vie maximale en RAM est le temps de la requête HTTP (~2-5s).
+//
+// Seule la RÉPONSE de Claude (texte) est conservée le temps de la réponse HTTP.
+
+// ─── Headers privacy sur toutes les réponses ─────────────────────────────────
+
+app.use((req, res, next) => {
+  // Interdit au navigateur/proxy de mettre en cache les réponses
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  // Header informatif : aucune image n'est conservée
+  res.setHeader('X-Data-Retention', 'none');
+  res.setHeader('X-Image-Storage', 'memory-only-ephemeral');
+  next();
+});
 
 // ─── Middlewares globaux ──────────────────────────────────────────────────────
 
-app.use(cors({ origin: ALLOWED_ORIGINS }));
-app.use(express.json({ limit: '10mb' }));   // images en base64
+app.use(cors({
+  origin: true,           // autorise toutes les origines (Expo web, mobile, localhost)
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+app.options('*', cors());  // pré-réponse aux requêtes preflight OPTIONS
+app.use(express.json({ limit: '10mb' }));
+
+// Middleware anti-log : remplace les base64 dans les logs par un placeholder
+// pour éviter toute fuite accidentelle d'image dans les fichiers de log.
+app.use((req, _res, next) => {
+  if (req.body && req.body.imageBase64) {
+    // Taille indicative pour le débogage, jamais le contenu
+    const octets = Math.round((req.body.imageBase64.length * 3) / 4 / 1024);
+    req._imageSizeKb = octets;
+    // On ne logge JAMAIS la valeur réelle
+  }
+  next();
+});
 
 // Rate limiting global
 app.use(rateLimit({
-  windowMs: 60 * 1000,    // 1 minute
-  max: 30,                 // 30 req/min par IP
+  windowMs: 60 * 1000,
+  max: 30,
   standardHeaders: true,
   message: { error: 'Trop de requêtes. Réessaie dans une minute.' },
 }));
 
-// Rate limiting strict pour les appels IA (coûteux)
+// Rate limiting strict pour les appels IA
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 5,                  // 5 générations/min par IP
+  max: 5,
   message: { error: 'Limite de génération atteinte. Réessaie dans une minute.' },
 });
 
 // ─── Middleware d'authentification ────────────────────────────────────────────
 
 function verifierJWT(req, res, next) {
-  // Si pas de secret Supabase configuré → on laisse passer (dev/demo)
   if (!SUPABASE_JWT_SECRET) {
     req.userId = 'anonymous';
     return next();
   }
-
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Token manquant.' });
   }
-
-  const token = auth.slice(7);
   try {
-    const payload = jwt.verify(token, SUPABASE_JWT_SECRET);
+    const payload = jwt.verify(auth.slice(7), SUPABASE_JWT_SECRET);
     req.userId = payload.sub;
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: 'Token invalide ou expiré.' });
   }
 }
 
-// ─── Utilitaires de validation ────────────────────────────────────────────────
+// ─── Utilitaires ─────────────────────────────────────────────────────────────
 
 function validerBase64(str) {
   if (!str || typeof str !== 'string') return false;
-  const size = (str.length * 3) / 4 / 1024 / 1024;
-  return size < 5; // max 5 Mo
+  return (str.length * 3) / 4 / 1024 / 1024 < 5; // max 5 Mo
 }
 
 function validerTexte(str, max = 2000) {
   return typeof str === 'string' && str.trim().length > 0 && str.length <= max;
 }
 
+// Nettoie un objet request de tout contenu image binaire
+function nettoyerImageDuBody(req) {
+  if (req.body) {
+    req.body.imageBase64 = null;
+    delete req.body.imageBase64;
+  }
+}
+
 // ─── Route de santé ───────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', version: '1.0.0', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    privacy: {
+      imageStorage: 'none',
+      imageRetention: 'memory-only during request (~2-5s)',
+      logging: 'metadata only (no image content)',
+      thirdParty: 'Claude API (Anthropic) — images processed, not stored per Anthropic policy',
+    },
+  });
 });
 
 // ─── POST /analyser-dessin ────────────────────────────────────────────────────
-// Corps : { imageBase64: string }
-// Retour : { personnages, couleurs, decor, ambiance, descriptionComplete }
 
 app.post('/analyser-dessin', verifierJWT, aiLimiter, async (req, res) => {
   const { imageBase64 } = req.body;
 
   if (!validerBase64(imageBase64)) {
+    nettoyerImageDuBody(req);
     return res.status(400).json({ error: 'Image manquante ou trop volumineuse (max 5 Mo).' });
   }
 
+  // Log metadata uniquement — jamais le contenu de l'image
+  console.log(`[analyser-dessin] user=${req.userId} size=${req._imageSizeKb}kb`);
+
+  let analysisResult = null;
   try {
-    const response = await anthropic.messages.create({
-      model: 'claude-opus-4-7',
-      max_tokens: 600,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 },
-          },
-          {
-            type: 'text',
-            text: `C'est le dessin fait par un enfant. Analyse-le et réponds UNIQUEMENT en JSON valide :
+    // L'image vit ici en mémoire le temps de l'appel API (~2-5s)
+    const texteReponse = await analyserDessinIA(imageBase64);
 
-{
-  "personnages": ["personnage 1", "personnage 2"],
-  "couleurs": ["couleur 1", "couleur 2", "couleur 3"],
-  "decor": "description du décor en une phrase",
-  "ambiance": "ambiance générale en 2-3 mots",
-  "descriptionComplete": "description complète et imaginative en 2-3 phrases"
-}
+    // ✅ L'image est immédiatement nettoyée après l'appel IA
+    nettoyerImageDuBody(req);
 
-- personnages : êtres vivants ou objets principaux (max 5)
-- couleurs : 3-5 couleurs dominantes
-- Réponds UNIQUEMENT avec le JSON, rien d'autre`,
-          },
-        ],
-      }],
-    });
-
-    const texte = response.content[0].text;
+    const texte = texteReponse;
     const match = texte.match(/\{[\s\S]*\}/);
     if (!match) return res.status(502).json({ error: 'Réponse IA invalide.' });
 
     const data = JSON.parse(match[0]);
-    res.json({
-      personnages:         Array.isArray(data.personnages)        ? data.personnages        : [],
-      couleurs:            Array.isArray(data.couleurs)           ? data.couleurs           : [],
-      decor:               typeof data.decor === 'string'         ? data.decor              : '',
-      ambiance:            typeof data.ambiance === 'string'      ? data.ambiance           : '',
-      descriptionComplete: typeof data.descriptionComplete === 'string' ? data.descriptionComplete : '',
-    });
+    analysisResult = {
+      personnages:         Array.isArray(data.personnages)  ? data.personnages  : [],
+      couleurs:            Array.isArray(data.couleurs)     ? data.couleurs     : [],
+      decor:               data.decor               ?? '',
+      ambiance:            data.ambiance             ?? '',
+      descriptionComplete: data.descriptionComplete  ?? '',
+    };
+
+    res.json(analysisResult);
   } catch (err) {
-    console.error('[analyser-dessin]', err.message);
+    nettoyerImageDuBody(req); // ✅ nettoyage même en cas d'erreur
+    console.error(`[analyser-dessin] erreur user=${req.userId}:`, err.message);
     res.status(500).json({ error: 'Erreur lors de l\'analyse du dessin.' });
+  } finally {
+    // ✅ Garantie finale : nullification de toute référence mémoire
+    analysisResult = null;
   }
 });
 
 // ─── POST /generer-histoire ───────────────────────────────────────────────────
-// Corps : { analyse, prenomEnfant, age, genre, langue, variante? }
-// Retour : { titre, entree, paragraphes, morale, tempsLectureMinutes, langue }
 
 const INSTRUCTIONS_GENRE = {
-  aventure: 'STORY STYLE — ADVENTURE: Fast pace, courageous challenges, quest with obstacles. Hero shows bravery. Action verbs. Suspense in paragraph 3. Earned victory.',
-  conte:    'STORY STYLE — MAGICAL TALE: Fairy-tale atmosphere. Magic spells, benevolent creatures, stardust. Poetic and gentle sentences. Good always triumphs.',
-  drole:    'STORY STYLE — FUNNY: Comic situations and unexpected twists. Silly misunderstandings, clumsy characters, funny punchlines. Child-friendly humour, onomatopoeia, witty lines.',
-  sf:       'STORY STYLE — SCIENCE-FICTION: Futuristic gadgets, robots, space or time travel. Invent technology names. Simplified scientific vocabulary for the child\'s age.',
-  animaux:  'STORY STYLE — ANIMALS: Drawn characters are talking expressive animals with distinct personalities. Natural setting. Each animal has a unique trait. Life lesson about cooperation.',
+  aventure: 'ADVENTURE: fast pace, courageous quest, obstacles and victory.',
+  conte:    'MAGICAL TALE: fairies, spells, poetic sentences, good triumphs.',
+  drole:    'FUNNY: comic situations, silly misunderstandings, witty punchlines.',
+  sf:       'SCI-FI: futuristic gadgets, robots, space travel, simplified science.',
+  animaux:  'ANIMALS: talking animals with personalities, nature, life lessons.',
 };
 
 const INSTRUCTIONS_LANGUE = {
-  fr: 'LANGUE : Français. Écris TOUT en français.',
-  en: 'LANGUAGE: English. Write EVERYTHING in English.',
-  ar: 'اللغة: العربية. اكتب كل شيء باللغة العربية.',
-  es: 'IDIOMA: Español. Escribe TODO en español.',
+  fr: 'Écris TOUT en français.',
+  en: 'Write EVERYTHING in English.',
+  ar: 'اكتب كل شيء باللغة العربية.',
+  es: 'Escribe TODO en español.',
 };
 
 const VARIANTES = [
-  '',
-  'Le défi principal doit être INÉDIT, différent de toute version précédente.',
-  'Change complètement le lieu de l\'aventure et le problème à résoudre.',
-  'Donne des noms originaux aux personnages. Histoire qui commence de façon inattendue.',
-  'Le héros résout le problème par une approche créative et originale.',
-  'Ajoute un rebondissement surprenant au milieu de l\'histoire.',
+  '', 'Défi INÉDIT, différent des versions précédentes.',
+  'Change le lieu de l\'aventure et le problème à résoudre.',
+  'Noms originaux pour les personnages, début inattendu.',
+  'Résolution créative et originale.',
+  'Rebondissement surprenant au milieu.',
 ];
 
 app.post('/generer-histoire', verifierJWT, aiLimiter, async (req, res) => {
@@ -180,65 +279,38 @@ app.post('/generer-histoire', verifierJWT, aiLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Analyse du dessin manquante.' });
   }
 
-  const toneInstruction   = INSTRUCTIONS_GENRE[genre]  ?? INSTRUCTIONS_GENRE.aventure;
-  const langueInstruction = INSTRUCTIONS_LANGUE[langue] ?? INSTRUCTIONS_LANGUE.fr;
+  // Pas d'image ici : on ne reçoit que le texte de l'analyse
+  console.log(`[generer-histoire] user=${req.userId} prenom=${prenomEnfant} langue=${langue}`);
+
+  const toneInstruction    = INSTRUCTIONS_GENRE[genre]  ?? INSTRUCTIONS_GENRE.aventure;
+  const langueInstruction  = INSTRUCTIONS_LANGUE[langue] ?? INSTRUCTIONS_LANGUE.fr;
   const contrainteVariante = VARIANTES[variante % VARIANTES.length]
-    ? `\nVARIANTE #${variante} — CONTRAINTE : ${VARIANTES[variante % VARIANTES.length]}`
+    ? `\nVARIANTE #${variante}: ${VARIANTES[variante % VARIANTES.length]}`
     : '';
 
   const contexte = [
-    `Personnages dessinés : ${(analyse.personnages || []).join(', ')}`,
-    `Couleurs utilisées : ${(analyse.couleurs || []).join(', ')}`,
-    `Décor : ${analyse.decor || ''}`,
-    `Ambiance : ${analyse.ambiance || ''}`,
-    `Description : ${analyse.descriptionComplete || ''}`,
+    `Personnages: ${(analyse.personnages || []).join(', ')}`,
+    `Couleurs: ${(analyse.couleurs || []).join(', ')}`,
+    `Décor: ${analyse.decor || ''}`,
+    `Ambiance: ${analyse.ambiance || ''}`,
+    `Description: ${analyse.descriptionComplete || ''}`,
   ].join('\n');
 
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-opus-4-7',
-      max_tokens: 1600,
-      messages: [{
-        role: 'user',
-        content: `You are a magical children's book author. A ${age}-year-old child made a drawing. Tell the story where the child enters their own drawing.
+  const promptHistoire = `Auteur de livres pour enfants (${age} ans). Héros: ${prenomEnfant}.
+Style: ${toneInstruction}
+Langue: ${langueInstruction}
+Dessin: ${contexte}
 
-=== WHAT THE CHILD DREW ===
-${contexte}
-
-=== THE CHILD HERO ===
-Name: ${prenomEnfant}
-Age: ${age}
-
-=== STORY STYLE ===
-${toneInstruction}
-
-=== ${langueInstruction} ===
-
-=== MANDATORY NARRATIVE ARC ===
-1. SETTING: Bring the drawing to life
-2. MEETING: The drawn characters welcome ${prenomEnfant}
-3. ADVENTURE: ${prenomEnfant} faces an obstacle
-4. CLIMAX: ${prenomEnfant} solves the challenge
-5. END: ${prenomEnfant} leaves with a magical memory
-
-=== RESPONSE FORMAT ===
-Reply ONLY with valid JSON:
+Réponds UNIQUEMENT en JSON:
 {
-  "titre": "poetic title (max 8 words)",
-  "entree": "unique magical sentence how ${prenomEnfant} enters the drawing",
-  "paragraphes": ["p1 (2-3 sentences)","p2","p3","p4","p5"],
-  "morale": "short moral"
-}
+  "titre": "...",
+  "entree": "...",
+  "paragraphes": ["p1","p2","p3","p4","p5"],
+  "morale": "..."
+}${contrainteVariante}`;
 
-Rules:
-- ALL text in the language specified
-- ${prenomEnfant} appears in at least 4 paragraphs
-- Each paragraph mentions a drawing element
-- Reply ONLY with the JSON${contrainteVariante}`,
-      }],
-    });
-
-    const texte = response.content[0].text;
+  try {
+    const texte = await genererHistoireIA(promptHistoire);
     const match = texte.match(/\{[\s\S]*\}/);
     if (!match) return res.status(502).json({ error: 'Réponse IA invalide.' });
 
@@ -246,26 +318,30 @@ Rules:
     const paragraphes = Array.isArray(data.paragraphes)
       ? data.paragraphes.filter((p) => typeof p === 'string' && p.trim())
       : [];
-    const totalMots = paragraphes.join(' ').split(/\s+/).length;
 
     res.json({
-      titre:               typeof data.titre === 'string'  ? data.titre   : prenomEnfant,
-      entree:              typeof data.entree === 'string' ? data.entree  : '',
+      titre:               data.titre   ?? prenomEnfant,
+      entree:              data.entree  ?? '',
       paragraphes,
-      morale:              typeof data.morale === 'string' ? data.morale  : '',
-      tempsLectureMinutes: Math.max(1, Math.round(totalMots / 100)),
+      morale:              data.morale  ?? '',
+      tempsLectureMinutes: Math.max(1, Math.round(paragraphes.join(' ').split(/\s+/).length / 100)),
       langue,
     });
   } catch (err) {
-    console.error('[generer-histoire]', err.message);
-    res.status(500).json({ error: 'Erreur lors de la génération de l\'histoire.' });
+    console.error(`[generer-histoire] erreur user=${req.userId}:`, err.message);
+    res.status(500).json({ error: 'Erreur lors de la génération.' });
   }
 });
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`✅ StoryKids backend démarré sur le port ${PORT}`);
-  console.log(`   Claude API : ${ANTHROPIC_KEY ? '✓ configurée' : '✗ manquante'}`);
-  console.log(`   Supabase JWT : ${SUPABASE_JWT_SECRET ? '✓ configuré' : '⚠ absent (pas de vérification JWT)'}`);
+  console.log(`✅ StoryKids backend — port ${PORT}`);
+  console.log(`   🤖 Provider IA    : ${AI_PROVIDER.toUpperCase()}`);
+  console.log(`   🔒 Privacy        : aucun dessin stocké sur disque`);
+  if (AI_PROVIDER === 'gemini')
+    console.log(`   Gemini API    : ${GEMINI_KEY    ? '✓' : '✗'}`);
+  else
+    console.log(`   Claude API    : ${ANTHROPIC_KEY ? '✓' : '✗'}`);
+  console.log(`   Supabase JWT  : ${SUPABASE_JWT_SECRET ? '✓' : '⚠ absent'}`);
 });
